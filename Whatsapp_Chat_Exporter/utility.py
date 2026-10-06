@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from enum import IntEnum
 from tqdm import tqdm
 from Whatsapp_Chat_Exporter.data_model import ChatCollection, ChatStore, Timing
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Any
 try:
     from enum import StrEnum, IntEnum
 except ImportError:
@@ -610,6 +610,65 @@ def get_chat_condition(
 
     combined_conditions = "".join(conditions)
     return f"AND ({combined_conditions})"
+
+
+PERSON_MODES = ("direct", "created", "is-on-chat")
+
+
+class PersonFilter(NamedTuple):
+    """A resolved --person filter.
+
+    direct/created hold the phone numbers given in MODE:NUMBER form. member_chats
+    holds the chat JIDs resolved from the database for is-on-chat persons
+    (their direct chat plus the groups they participate in).
+    """
+    direct: List[str]
+    created: List[str]
+    member_chats: List[str]
+
+
+def get_person_chat_condition(
+    person_filter: Optional[PersonFilter],
+    chat_jid_column: str
+) -> str:
+    """Generates a chat-level SQL condition for the --person filter.
+
+    Unlike get_chat_condition(), which selects rows where the person is the
+    chat or the sender, this selects every row of the chats matching the
+    person, preserving the other participants' messages as context.
+
+    SQL injection risks were evaluated as for get_chat_condition(): the values
+    come from the trusted command line and, for member_chats, from the
+    database itself.
+
+    Args:
+        person_filter: The resolved PersonFilter, or None if --person was not given.
+        chat_jid_column: The chat JID SQL expression valid in the caller's WHERE
+            clause (the same string passed as columns[0] to get_chat_condition()).
+
+    Returns:
+        A SQL condition string. An empty filter matches nothing ("AND (0 = 1)")
+        rather than everything, so a person unknown to the database never
+        silently exports all chats.
+    """
+    if person_filter is None:
+        return ""
+
+    terms = []
+    for number in person_filter.direct:
+        terms.append(f"{chat_jid_column} = '{number}@s.whatsapp.net'")
+    for number in person_filter.created:
+        terms.append(f"{chat_jid_column} LIKE '{number}-%'")
+    if person_filter.member_chats:
+        quoted = ", ".join(
+            f"'{jid.replace(chr(39), chr(39) * 2)}'"
+            for jid in person_filter.member_chats
+        )
+        terms.append(f"{chat_jid_column} IN ({quoted})")
+
+    if not terms:
+        return "AND (0 = 1)"
+    return "AND ( " + " OR ".join(terms) + ")"
 
 
 # Android Specific

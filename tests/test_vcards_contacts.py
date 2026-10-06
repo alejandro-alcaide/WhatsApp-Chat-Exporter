@@ -1,7 +1,12 @@
 # from contacts_names_from_vcards import readVCardsFile
 
 import os
-from Whatsapp_Chat_Exporter.vcards_contacts import normalize_number, read_vcards_file
+from Whatsapp_Chat_Exporter.vcards_contacts import (
+    map_number_to_name,
+    normalize_number,
+    process_vcard_entry,
+    read_vcards_file,
+)
 
 
 def test_readVCardsFile():
@@ -46,3 +51,32 @@ def test_normalize_number():
     assert normalize_number('+1531234567', '34') == '1531234567'
     assert normalize_number('053(123)4567', '34') == '34531234567'
     assert normalize_number('0531-234-567', '58') == '58531234567'
+
+
+# read_vcards_file splits on "BEGIN:VCARD", so entries reach
+# process_vcard_entry WITHOUT the BEGIN line.
+def _vcard_entry(tel_line):
+    return f"VERSION:3.0\nN:Test;Contact;;;\nFN:Test Contact\n{tel_line}\nEND:VCARD"
+
+
+def test_waid_preferred_over_tel_value():
+    # Mexican mobile numbers: the TEL value (E.164, no carrier 1) does not
+    # match the JID (52 1 XXX...), but the waid parameter is the exact ID.
+    contact = process_vcard_entry(_vcard_entry(
+        "TEL;type=Celular;waid=5213314010847:+52 33 1401 0847"))
+    mapping = map_number_to_name([contact], "52")
+    assert mapping == [("5213314010847", "Test Contact")]
+
+
+def test_tel_value_used_when_no_waid():
+    contact = process_vcard_entry(_vcard_entry(
+        "TEL;type=Celular:+52 33 1401 0847"))
+    mapping = map_number_to_name([contact], "52")
+    assert mapping == [("523314010847", "Test Contact")]
+
+
+def test_waid_only_digits_kept():
+    contact = process_vcard_entry(_vcard_entry(
+        "TEL;type=Celular;waid=\"+52 133 1401 0847\":+52 33 1401 0847"))
+    mapping = map_number_to_name([contact], "52")
+    assert mapping == [("5213314010847", "Test Contact")]

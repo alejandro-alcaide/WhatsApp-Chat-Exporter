@@ -347,6 +347,65 @@ class TestGetChatCondition:
         """Test with special characters in filter values"""
         result = get_chat_condition(["test@example.com"], True, ["email"])
         assert result == "AND ( email LIKE '%test@example.com%')"
-        
+
         result = get_chat_condition(["user-name"], True, ["username"])
         assert result == "AND ( username LIKE '%user-name%')"
+
+
+class TestGetPersonChatCondition:
+    def test_no_filter(self):
+        """Test when person filter is None"""
+        result = get_person_chat_condition(None, "key_remote_jid")
+        assert result == ""
+
+    def test_empty_filter_matches_nothing(self):
+        """Test that an empty resolved filter matches nothing, not everything"""
+        result = get_person_chat_condition(PersonFilter([], [], []), "key_remote_jid")
+        assert result == "AND (0 = 1)"
+
+    def test_single_direct(self):
+        """Test a single direct chat"""
+        result = get_person_chat_condition(PersonFilter(["111"], [], []), "key_remote_jid")
+        assert result == "AND ( key_remote_jid = '111@s.whatsapp.net')"
+
+    def test_multiple_direct(self):
+        """Test multiple direct chats OR-joined"""
+        result = get_person_chat_condition(
+            PersonFilter(["111", "222"], [], []), "key_remote_jid")
+        assert result == ("AND ( key_remote_jid = '111@s.whatsapp.net'"
+                          " OR key_remote_jid = '222@s.whatsapp.net')")
+
+    def test_single_created(self):
+        """Test groups created by one person"""
+        result = get_person_chat_condition(PersonFilter([], ["222"], []), "key_remote_jid")
+        assert result == "AND ( key_remote_jid LIKE '222-%')"
+
+    def test_member_chats(self):
+        """Test resolved member chats"""
+        result = get_person_chat_condition(
+            PersonFilter([], [], ["333-1@g.us", "333-2@g.us"]), "key_remote_jid")
+        assert result == "AND ( key_remote_jid IN ('333-1@g.us', '333-2@g.us'))"
+
+    def test_all_modes_combined(self):
+        """Test all modes combined in direct, created, IN order"""
+        result = get_person_chat_condition(
+            PersonFilter(["111"], ["222"], ["333-1@g.us"]), "key_remote_jid")
+        expected = ("AND ( key_remote_jid = '111@s.whatsapp.net'"
+                    " OR key_remote_jid LIKE '222-%'"
+                    " OR key_remote_jid IN ('333-1@g.us'))")
+        assert result == expected
+
+    def test_qualified_column(self):
+        """Test with a column expression qualified by table name"""
+        result = get_person_chat_condition(PersonFilter(["111"], [], []), "messages.key_remote_jid")
+        assert result == "AND ( messages.key_remote_jid = '111@s.whatsapp.net')"
+
+    def test_member_chat_quote_escaping(self):
+        """Test that single quotes in chat JIDs are escaped by doubling"""
+        result = get_person_chat_condition(
+            PersonFilter([], [], ["we'ird@g.us"]), "key_remote_jid")
+        assert result == "AND ( key_remote_jid IN ('we''ird@g.us'))"
+
+    def test_person_modes_tuple(self):
+        """Test the exported mode names"""
+        assert PERSON_MODES == ("direct", "created", "is-on-chat")

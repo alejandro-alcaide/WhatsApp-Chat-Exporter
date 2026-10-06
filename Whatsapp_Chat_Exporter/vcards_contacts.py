@@ -1,7 +1,7 @@
 import logging
 import re
 import quopri
-from typing import List, TypedDict
+from typing import List, Optional, Tuple, TypedDict
 from Whatsapp_Chat_Exporter.data_model import ChatStore
 from Whatsapp_Chat_Exporter.utility import Device
 
@@ -10,7 +10,7 @@ from Whatsapp_Chat_Exporter.utility import Device
 
 class ExportedContactNumbers(TypedDict):
     full_name: str
-    numbers: List[str]
+    numbers: List[Tuple[str, Optional[str]]]  # (TEL value, waid or None)
 
 
 class ContactsFromVCards:
@@ -80,22 +80,31 @@ def _parse_vcard_line(line: str) -> tuple[str, dict[str, str], str] | None:
 
 def get_vcard_value(entry: str, field_name: str) -> list[str]:
     """
-    Scans the vCard entry for lines starting with the specific field_name 
+    Scans the vCard entry for lines starting with the specific field_name
     and returns a list of its decoded values, handling parameters like
+    ENCODING and CHARSET.
+    """
+    return [value for _, value in _get_vcard_values_with_params(entry, field_name)]
+
+
+def _get_vcard_values_with_params(entry: str, field_name: str):
+    """
+    Scans the vCard entry for lines of the given field and yields
+    (parameters, decoded_value) pairs, handling parameters like
     ENCODING and CHARSET.
     """
     target_name = field_name.upper()
     cached_line = ""
     charset = "utf-8"
-    values = []
-    
+    cached_params = {}
+
     for line in entry.splitlines():
         line = line.strip()
         if cached_line:
             if line.endswith('='):
                 cached_line += line[:-1]
                 continue  # Wait for the next line to complete the value
-            values.append(decode_quoted_printable(cached_line + line, charset))
+            yield cached_params, decode_quoted_printable(cached_line + line, charset)
             cached_line = ""
         else:
             # Skip empty lines or lines that don't start with the target field (after stripping)
@@ -119,13 +128,13 @@ def get_vcard_value(entry: str, field_name: str) -> list[str]:
                 if raw_value.endswith('='):
                     # Handle soft line breaks in quoted-printable and cache the line
                     cached_line += raw_value[:-1]
+                    cached_params = params
                     continue  # Wait for the next line to complete the value
-                values.append(decode_quoted_printable(raw_value, charset))
+                yield params, decode_quoted_printable(raw_value, charset)
             elif encoding:
                 raise NotImplementedError(f"Encoding '{encoding}' not supported yet.")
             else:
-                values.append(raw_value)
-    return values
+                yield params, raw_value
 
 
 def process_vcard_entry(entry: str) -> dict | bool:
@@ -150,14 +159,17 @@ def process_vcard_entry(entry: str) -> dict | bool:
     if not name:
         return False
 
-    numbers = get_vcard_value(entry, "TEL")
-    if not numbers:
+    tel_pairs = [
+        (value, params.get("WAID"))
+        for params, value in _get_vcard_values_with_params(entry, "TEL")
+    ]
+    if not tel_pairs:
         return False
 
     return {
         "full_name": name,
-        # Remove duplications
-        "numbers": set(numbers),
+        # Remove duplications, keeping first occurrences
+        "numbers": list(dict.fromkeys(tel_pairs)),
     }
 
 
@@ -186,8 +198,15 @@ def filter_chats_by_prefix(chats, prefix: str):
 def map_number_to_name(contacts, default_country_code: str):
     mapping = []
     for contact in contacts:
-        for index, num in enumerate(contact['numbers']):
-            normalized = normalize_number(num, default_country_code)
+        for index, (raw_number, waid) in enumerate(contact['numbers']):
+            # The waid parameter carries the exact WhatsApp ID of the
+            # contact; prefer it over the TEL value, which can differ from
+            # the JID (e.g. Mexican numbers, where the JID keeps a carrier 1
+            # the phone number does not).
+            if waid:
+                normalized = ''.join(c for c in waid if c.isdigit())
+            else:
+                normalized = normalize_number(raw_number, default_country_code)
             if len(contact['numbers']) > 1:
                 name = f"{contact['full_name']} ({index+1})"
             else:

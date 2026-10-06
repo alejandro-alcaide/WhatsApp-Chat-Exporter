@@ -159,7 +159,8 @@ usage: wtsexporter [-h] [--debug] [-a] [-i] [-e EXPORTED] [-w WA] [-m MEDIA] [-b
                    [--offline OFFLINE] [--no-avatar] [--old-theme] [--headline HEADLINE] [-c]
                    [--create-separated-media] [--time-offset {-12 to 14}] [--date DATE]
                    [--date-format FORMAT] [--include [phone number ...]] [--exclude [phone number ...]]
-                   [--dont-filter-empty] [--enrich-from-vcards ENRICH_FROM_VCARDS]
+                   [--person [MODE:phone number ...]] [--dont-filter-empty]
+                   [--enrich-from-vcards ENRICH_FROM_VCARDS]
                    [--default-country-code DEFAULT_COUNTRY_CODE] [--incremental-merge]
                    [--source-dir SOURCE_DIR] [--target-dir TARGET_DIR] [-s] [--check-update]
                    [--check-update-pre] [--assume-first-as-me] [--business]
@@ -224,7 +225,7 @@ HTML Options:
 Media Handling:
   -c, --move-media      Move the media directory to output directory if the flag is set, otherwise copy it
   --create-separated-media
-                        Create a copy of the media seperated per chat in <MEDIA>/separated/ directory
+                        Create a copy of the media seperated per chat in the <MEDIA>/separated/ directory of the output (on Android written there directly, never inside the phone backup)
 
 Filtering Options:
   --time-offset {-12 to 14}
@@ -235,6 +236,12 @@ Filtering Options:
                         Include chats that match the supplied phone number
   --exclude [phone number ...]
                         Exclude chats that match the supplied phone number
+  --person [MODE:phone number ...]
+                        Export chats related to a person, in MODE:phone number form. Modes:
+                        direct (the 1:1 chat with the number), created (groups created by the
+                        number), is-on-chat (all chats where the number is a participant, with
+                        the full context of the other participants). Multiple values are
+                        combined. Android only; cannot be used with --include or --exclude
   --dont-filter-empty   By default, the exporter will not render chats with no valid message. Setting this
                         flag will cause the exporter to render those. This is useful if chat(s) are
                         missing from the output

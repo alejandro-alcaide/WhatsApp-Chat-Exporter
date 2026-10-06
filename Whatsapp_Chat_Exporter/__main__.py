@@ -17,6 +17,7 @@ from Whatsapp_Chat_Exporter.utility import readable_to_bytes, safe_name, bytes_t
 from Whatsapp_Chat_Exporter.utility import import_from_json, incremental_merge, check_update
 from Whatsapp_Chat_Exporter.utility import telegram_json_format, convert_time_unit, DbType
 from Whatsapp_Chat_Exporter.utility import get_transcription_selection, check_jid_map
+from Whatsapp_Chat_Exporter.utility import PERSON_MODES
 from argparse import ArgumentParser, SUPPRESS
 from datetime import datetime
 from getpass import getpass
@@ -194,7 +195,7 @@ def setup_argument_parser() -> ArgumentParser:
     )
     media_group.add_argument(
         "--create-separated-media", dest="separate_media", default=False, action='store_true',
-        help="Create a copy of the media seperated per chat in <MEDIA>/separated/ directory"
+        help="Create a copy of the media seperated per chat in the <MEDIA>/separated/ directory of the output (on Android written there directly, never inside the phone backup)"
     )
 
     # Filtering options
@@ -218,6 +219,14 @@ def setup_argument_parser() -> ArgumentParser:
     filter_group.add_argument(
         "--exclude", dest="filter_chat_exclude", nargs='*', metavar="phone number",
         help="Exclude chats that match the supplied phone number"
+    )
+    filter_group.add_argument(
+        "--person", dest="filter_person", default=None, nargs='*', metavar="MODE:phone number",
+        help=("Export chats related to a person, in MODE:phone number form. Modes: "
+              "direct (the 1:1 chat with the number), created (groups created by the number), "
+              "is-on-chat (all chats where the number is a participant, with the full context "
+              "of the other participants). Multiple values are combined. "
+              "Android only; cannot be used with --include or --exclude")
     )
     filter_group.add_argument(
         "--dont-filter-empty", dest="filter_empty", default=True, action='store_false',
@@ -313,6 +322,17 @@ def validate_args(parser: ArgumentParser, args) -> None:
         parser.error("You must define only one device type.")
     if not args.android and not args.ios and not args.exported and not args.import_json:
         parser.error("You must define the device type.")
+
+    # Person filter validation (before other checks: --person has its own
+    # platform and flag-combination rules and must reject invalid runs early)
+    if args.filter_person is not None:
+        if args.ios:
+            parser.error("--person is not yet supported on iOS.")
+        if args.exported is not None or args.import_json:
+            parser.error("--person cannot be used with --exported or --import.")
+        if args.filter_chat_include is not None or args.filter_chat_exclude is not None:
+            parser.error("--person cannot be used together with --include or --exclude.")
+        validate_person_filters(parser, args.filter_person)
     if args.no_html and not args.json and not args.text_format:
         parser.error(
             "You must either specify a JSON output file, text file output directory or enable HTML output.")
@@ -379,6 +399,18 @@ def validate_chat_filters(parser: ArgumentParser, chat_filter: Optional[List[str
             if not chat.isnumeric():
                 parser.error(
                     "Enter a phone number in the chat filter. See https://wts.knugi.dev/docs?dest=chat")
+
+
+def validate_person_filters(parser: ArgumentParser, person_values: Optional[List[str]]) -> None:
+    """Validate --person values: MODE:phone number with a known mode."""
+    if person_values is None:
+        return
+    for value in person_values:
+        mode, sep, number = value.partition(":")
+        if not sep or mode not in PERSON_MODES or not number.isnumeric():
+            parser.error(
+                f"Invalid --person value '{value}'. Expected MODE:phone number, where MODE is "
+                "one of: direct, created, is-on-chat (e.g. --person is-on-chat:4915112345678)")
 
 
 def process_date_filter(parser: ArgumentParser, args) -> None:
@@ -546,7 +578,7 @@ def process_messages(args, data: ChatCollection) -> None:
         )
         exit(6)
 
-    filter_chat = (args.filter_chat_include, args.filter_chat_exclude)
+    filter_chat = None
     timing = Timing(args.timezone_offset if args.timezone_offset else CURRENT_TZ_OFFSET)
 
     with sqlite3.connect(msg_db) as db:
@@ -558,25 +590,45 @@ def process_messages(args, data: ChatCollection) -> None:
             message_handler = android_handler
             data.set_system("jid_map_exists", check_jid_map(db))
             data.set_system("transcription_selection", get_transcription_selection(db))
+            person_filter = android_handler.resolve_person_filter(db, args.filter_person)
         else:
             message_handler = ios_handler
+            person_filter = None
+
+        filter_chat = (args.filter_chat_include, args.filter_chat_exclude, person_filter)
 
         message_handler.messages(
             db, data, args.media, timing, args.filter_date,
             filter_chat, args.filter_empty, args.no_reply_ios
         )
 
-        # Process media
-        message_handler.media(
-            db, data, args.media, args.filter_date,
-            filter_chat, args.filter_empty, args.separate_media, args.fix_dot_files
-        )
+        # Process media. On Android with --create-separated-media, the copies
+        # the output references are written directly into the output directory.
+        output_media_folder = get_output_media_folder(args) if args.android else None
+        if args.android:
+            message_handler.media(
+                db, data, args.media, args.filter_date,
+                filter_chat, args.filter_empty, args.separate_media,
+                args.fix_dot_files, output_media_folder
+            )
+        else:
+            message_handler.media(
+                db, data, args.media, args.filter_date,
+                filter_chat, args.filter_empty, args.separate_media,
+                args.fix_dot_files
+            )
 
         # Process vcards
-        message_handler.vcard(
-            db, data, args.media, args.filter_date,
-            filter_chat, args.filter_empty
-        )
+        if args.android:
+            message_handler.vcard(
+                db, data, args.media, args.filter_date,
+                filter_chat, args.filter_empty, output_media_folder
+            )
+        else:
+            message_handler.vcard(
+                db, data, args.media, args.filter_date,
+                filter_chat, args.filter_empty
+            )
 
         # Process calls
         process_calls(args, db, data, filter_chat, timing)
@@ -593,27 +645,84 @@ def process_calls(args, db, data: ChatCollection, filter_chat, timing) -> None:
             ios_handler.calls(cdb, data, timing, filter_chat)
 
 
+def get_output_media_folder(args):
+    """Return the output-directory folder the generated media copies are
+    written into, or None to keep writing them inside the media folder.
+
+    With --create-separated-media on Android, the separated/, thumbnails/
+    and vCards/ copies are part of the output, not of the phone backup:
+    writing them straight into the output directory leaves the media folder
+    untouched, and avoids a second copy of every file on filesystems
+    without reflinks (such as Windows).
+    """
+    if not (getattr(args, "android", False) and args.separate_media
+            and not args.move_media and args.media):
+        return None
+    target = os.path.normpath(os.path.join(args.output, args.media))
+    if os.path.abspath(target) == os.path.abspath(args.media):
+        # The media folder already is the target: writing the copies "into
+        # the output" would put them right back into the media folder.
+        return None
+    return target
+
+
 def handle_media_directory(args) -> None:
     """Handle media directory copying or moving."""
     if os.path.isdir(args.media):
         media_path = os.path.join(args.output, args.media)
 
-        if os.path.isdir(media_path):
+        if args.separate_media and not args.move_media:
+            if get_output_media_folder(args) is not None:
+                # On Android the copies the output references were already
+                # written directly into the output directory while processing.
+                logging.debug(
+                    "Generated media folders were written directly to the "
+                    "output directory; nothing left to copy")
+            else:
+                # With --create-separated-media, the output references the
+                # per-chat copies instead of the original media files, so
+                # only the folders the output points to are copied.
+                copy_referenced_media(args, media_path)
+        elif os.path.isdir(media_path):
             logging.info(
                 f"WhatsApp directory already exists in output directory. Skipping...")
+        elif args.move_media:
+            try:
+                logging.info(f"Moving media directory...", extra={"clear": True})
+                shutil.move(args.media, f"{args.output}/")
+                logging.info(f"Media directory has been moved to the output directory")
+            except PermissionError:
+                logging.warning("Cannot remove original WhatsApp directory. "
+                               "Perhaps the directory is opened?")
         else:
-            if args.move_media:
-                try:
-                    logging.info(f"Moving media directory...", extra={"clear": True})
-                    shutil.move(args.media, f"{args.output}/")
-                    logging.info(f"Media directory has been moved to the output directory")
-                except PermissionError:
-                    logging.warning("Cannot remove original WhatsApp directory. "
-                                   "Perhaps the directory is opened?")
-            else:
-                logging.info(f"Copying media directory...", extra={"clear": True})
-                shutil.copytree(args.media, media_path)
-                logging.info(f"Media directory has been copied to the output directory")
+            logging.info(f"Copying media directory...", extra={"clear": True})
+            shutil.copytree(args.media, media_path)
+            logging.info(f"Media directory has been copied to the output directory")
+
+
+def copy_referenced_media(args, media_path: str) -> None:
+    """Copy the media folders referenced by the output to the output directory.
+
+    Args:
+        args: Parsed command line arguments
+        media_path: Destination path of the media folder in the output directory
+    """
+    if args.ios:
+        referenced_folders = [
+            "separated",
+            os.path.join("Media", "Profile"),  # Avatars
+            os.path.join("Message", "vCards")
+        ]
+    else:
+        referenced_folders = ["separated", "thumbnails", "vCards"]
+
+    logging.info(f"Copying media referenced by the output...", extra={"clear": True})
+    os.makedirs(media_path, exist_ok=True)
+    for folder in referenced_folders:
+        source = os.path.join(args.media, folder)
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(media_path, folder), dirs_exist_ok=True)
+    logging.info(f"Media referenced by the output has been copied to the output directory")
 
 
 def create_output_files(args, data: ChatCollection) -> None:

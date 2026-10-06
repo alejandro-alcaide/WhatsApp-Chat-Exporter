@@ -15,6 +15,7 @@ from Whatsapp_Chat_Exporter.utility import MAX_SIZE, ROW_SIZE, JidType, Device, 
 from Whatsapp_Chat_Exporter.utility import rendering, get_file_name, setup_template, get_cond_for_empty
 from Whatsapp_Chat_Exporter.utility import get_status_location, convert_time_unit, get_jid_map_selection
 from Whatsapp_Chat_Exporter.utility import get_chat_condition, safe_name, bytes_to_readable, determine_metadata
+from Whatsapp_Chat_Exporter.utility import check_jid_map, get_person_chat_condition, PersonFilter, PERSON_MODES
 
 
 
@@ -58,6 +59,109 @@ def contacts(db, data, enrich_from_vcards):
     logging.info(f"Processed {total_row_number} contacts in {convert_time_unit(total_time)}")
 
     return True
+
+
+def _table_exists(cursor, name):
+    """Check whether a table exists in the database."""
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cursor.fetchone() is not None
+
+
+def _person_exists(cursor, direct_jid, use_jid_map):
+    """Check whether a person appears in the database, directly or as a LID mapping."""
+    cursor.execute("SELECT 1 FROM jid WHERE raw_string = ? LIMIT 1", (direct_jid,))
+    if cursor.fetchone() is not None:
+        return True
+    if use_jid_map:
+        cursor.execute(
+            """SELECT 1 FROM jid_map
+                INNER JOIN jid p ON p._id = jid_map.jid_row_id
+                WHERE p.raw_string = ? LIMIT 1""", (direct_jid,))
+        return cursor.fetchone() is not None
+    return False
+
+
+def resolve_person_filter(db, person_values):
+    """Resolve --person values into a PersonFilter.
+
+    direct:/created: modes need no database access. is-on-chat: resolves the
+    chat JIDs of the chats the person participates in — their direct chat
+    plus the groups recorded in the database's group membership tables —
+    following LID mappings through jid_map so both identities of a person
+    match.
+
+    Args:
+        db: The message database connection.
+        person_values: The --person values, each in MODE:NUMBER form.
+
+    Returns:
+        A PersonFilter, or None if no values were given.
+
+    Raises:
+        ValueError: If a value is not in MODE:NUMBER form with a known mode.
+    """
+    if not person_values:
+        return None
+
+    direct = []
+    created = []
+    on_chat_numbers = []
+    member_chats = set()
+
+    for value in person_values:
+        mode, sep, number = value.partition(":")
+        if not sep or mode not in PERSON_MODES:
+            raise ValueError(f"Invalid --person value: {value}")
+        if mode == "direct":
+            direct.append(number)
+        elif mode == "created":
+            created.append(number)
+        else:
+            on_chat_numbers.append(number)
+            member_chats.add(f"{number}@s.whatsapp.net")
+
+    if not on_chat_numbers:
+        return PersonFilter(direct, created, sorted(member_chats))
+
+    c = db.cursor()
+    use_jid_map = check_jid_map(db)
+    if _table_exists(c, "group_participant_user"):
+        if use_jid_map:
+            membership_query = """SELECT DISTINCT COALESCE(lg.raw_string, gj.raw_string)
+                    FROM group_participant_user gpu
+                    INNER JOIN jid gj ON gj._id = gpu.group_jid_row_id
+                    INNER JOIN jid uj ON uj._id = gpu.user_jid_row_id
+                    LEFT JOIN jid_map gm ON gm.lid_row_id = gpu.group_jid_row_id
+                    LEFT JOIN jid lg ON lg._id = gm.jid_row_id
+                    LEFT JOIN jid_map um ON um.lid_row_id = gpu.user_jid_row_id
+                    LEFT JOIN jid up ON up._id = um.jid_row_id
+                    WHERE COALESCE(up.raw_string, uj.raw_string) = ?"""
+        else:
+            membership_query = """SELECT DISTINCT gj.raw_string
+                    FROM group_participant_user gpu
+                    INNER JOIN jid gj ON gj._id = gpu.group_jid_row_id
+                    INNER JOIN jid uj ON uj._id = gpu.user_jid_row_id
+                    WHERE uj.raw_string = ?"""
+    else:
+        membership_query = "SELECT DISTINCT gjid FROM group_participants WHERE jid = ?"
+
+    for number in on_chat_numbers:
+        direct_jid = f"{number}@s.whatsapp.net"
+        previous_count = len(member_chats)
+        try:
+            c.execute(membership_query, (direct_jid,))
+            member_chats.update(row[0] for row in c.fetchall())
+        except sqlite3.OperationalError:
+            logging.warning(
+                "No group membership table found in the database. "
+                f"--person is-on-chat:{number} will only match the direct chat.")
+        if len(member_chats) == previous_count \
+                and not _person_exists(c, direct_jid, use_jid_map):
+            logging.warning(
+                f"No chats found for --person is-on-chat:{number}. "
+                "The export will not contain any chats for this person.")
+
+    return PersonFilter(direct, created, sorted(member_chats))
 
 
 def messages(db, data, media_folder, timezone_offset, filter_date, filter_chat, filter_empty, no_reply):
@@ -113,6 +217,7 @@ def _get_message_count(cursor, filter_empty, filter_date, filter_chat, jid_map_e
             filter_chat[0], True, ["messages.key_remote_jid", "messages.remote_resource"], "jid", "android")
         exclude_filter = get_chat_condition(
             filter_chat[1], False, ["messages.key_remote_jid", "messages.remote_resource"], "jid", "android")
+        person_filter = get_person_chat_condition(filter_chat[2], "messages.key_remote_jid")
 
         cursor.execute(f"""SELECT count()
                       FROM messages
@@ -124,7 +229,8 @@ def _get_message_count(cursor, filter_empty, filter_date, filter_chat, jid_map_e
                         {empty_filter}
                         {date_filter}
                         {include_filter}
-                        {exclude_filter}""")
+                        {exclude_filter}
+                        {person_filter}""")
     except sqlite3.OperationalError as e:
         logging.debug(f'Got sql error "{e}" in _get_message_count trying fallback.\n')
 
@@ -135,6 +241,7 @@ def _get_message_count(cursor, filter_empty, filter_date, filter_chat, jid_map_e
             filter_chat[0], True, ["key_remote_jid", "group_sender_jid"], "jid", "android")
         exclude_filter = get_chat_condition(
             filter_chat[1], False, ["key_remote_jid", "group_sender_jid"], "jid", "android")
+        person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
         cursor.execute(f"""SELECT count(),
                         {remote_jid_selection} as key_remote_jid,
@@ -153,7 +260,8 @@ def _get_message_count(cursor, filter_empty, filter_date, filter_chat, jid_map_e
                         {empty_filter}
                         {date_filter}
                         {include_filter}
-                        {exclude_filter}""")
+                        {exclude_filter}
+                        {person_filter}""")
     return cursor.fetchone()[0]
 
 
@@ -165,6 +273,7 @@ def _get_messages_cursor_legacy(cursor, filter_empty, filter_date, filter_chat):
         filter_chat[0], True, ["messages.key_remote_jid", "messages.remote_resource"], "jid_global", "android")
     exclude_filter = get_chat_condition(
         filter_chat[1], False, ["messages.key_remote_jid", "messages.remote_resource"], "jid_global", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "messages.key_remote_jid")
 
     cursor.execute(f"""SELECT messages.key_remote_jid,
                             messages._id,
@@ -217,6 +326,7 @@ def _get_messages_cursor_legacy(cursor, filter_empty, filter_date, filter_chat):
                         {date_filter}
                         {include_filter}
                         {exclude_filter}
+                        {person_filter}
                     GROUP BY messages._id
                     ORDER BY messages.timestamp ASC;""")
     return cursor
@@ -238,6 +348,7 @@ def _get_messages_cursor_new(
         filter_chat[0], True, ["key_remote_jid", "group_sender_jid"], "jid_global", "android")
     exclude_filter = get_chat_condition(
         filter_chat[1], False, ["key_remote_jid", "group_sender_jid"], "jid_global", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
     cursor.execute(f"""SELECT {remote_jid_selection} as key_remote_jid,
                             message._id,
@@ -303,6 +414,7 @@ def _get_messages_cursor_new(
                         {date_filter}
                         {include_filter}
                         {exclude_filter}
+                        {person_filter}
                     GROUP BY message._id;""")
     return cursor
 
@@ -578,7 +690,7 @@ def _get_reactions(db, data):
     logging.info(f"Processed {total_row_number} reactions in {convert_time_unit(total_time)}")
 
 
-def media(db, data, media_folder, filter_date, filter_chat, filter_empty, separate_media=True, fix_dot_files=False):
+def media(db, data, media_folder, filter_date, filter_chat, filter_empty, separate_media=True, fix_dot_files=False, output_media_folder=None):
     """
     Process WhatsApp media files from the database.
 
@@ -590,8 +702,11 @@ def media(db, data, media_folder, filter_date, filter_chat, filter_empty, separa
         filter_chat: Chat filter conditions
         filter_empty: Filter for empty chats
         separate_media: Whether to separate media files by chat
+        output_media_folder: Folder the generated copies (separated/,
+            thumbnails/) are written into; the media folder itself when None
     """
     c = db.cursor()
+    _check_media_folder_structure(c, media_folder)
     total_row_number = _get_media_count(c, filter_empty, filter_date, filter_chat)
     try:
         content_cursor = _get_media_cursor_legacy(c, filter_empty, filter_date, filter_chat)
@@ -602,17 +717,106 @@ def media(db, data, media_folder, filter_date, filter_chat, filter_empty, separa
     content = content_cursor.fetchone()
     mime = MimeTypes()
 
-    # Ensure thumbnails directory exists
-    Path(f"{media_folder}/thumbnails").mkdir(parents=True, exist_ok=True)
+    # Ensure thumbnails directory exists in the folder the copies are written to
+    write_folder = output_media_folder or media_folder
+    Path(f"{write_folder}/thumbnails").mkdir(parents=True, exist_ok=True)
 
     with tqdm(total=total_row_number, desc="Processing media", unit="media", leave=False) as pbar:
         while (content := _fetch_row_safely(content_cursor)) is not None:
-            _process_single_media(data, content, media_folder, mime, separate_media, fix_dot_files)
+            _process_single_media(data, content, media_folder, mime, separate_media, fix_dot_files, output_media_folder)
             pbar.update(1)
         total_time = pbar.format_dict['elapsed']
     logging.info(f"Processed {total_row_number} media in {convert_time_unit(total_time)}")
 
 # Helper functions for media processing
+
+def _check_media_folder_structure(cursor, media_folder):
+    """Check the media folder layout against the paths the database references.
+
+    The expected items are taken from the database itself (the distinct
+    second-level directories of message_media.file_path, e.g.
+    "Media/WhatsApp Images", plus two-component paths that reference a
+    file directly, e.g. ".Shared/xyz.opus"), so the check adapts to any
+    WhatsApp version instead of relying on a hard-coded list.
+
+    A wrong layout (typically the phone's WhatsApp folder copied one level
+    short, so that "WhatsApp Images" sits next to "Media" instead of inside
+    it) makes every media lookup fail silently. This turns that into an
+    explicit message before minutes of processing produce an export where
+    all media render as missing.
+    """
+    if not media_folder:
+        return
+    try:
+        cursor.execute(
+            "SELECT DISTINCT file_path FROM message_media "
+            "WHERE file_path IS NOT NULL AND file_path != ''")
+        rows = [row[0] for row in cursor.fetchall()]
+    except sqlite3.OperationalError:
+        return  # no message_media table: nothing to check the layout against
+    if not rows:
+        return
+
+    items = {}
+    for path in rows:
+        if path.startswith("/"):
+            # An absolute path refers to the phone's own filesystem, never
+            # to the folder given with -m: the whole path is the item.
+            items[path] = "file"
+            continue
+        parts = path.split("/")
+        item = "/".join(parts[:2])
+        if item not in items:
+            # More than two components means the item is a directory
+            # prefix; exactly two components reference the item itself,
+            # i.e. a file.
+            items[item] = "file" if len(parts) == 2 else "folder"
+
+    if all(item.startswith("/") for item in items):
+        return  # nothing in the database is expected inside -m
+
+    statuses = []
+    for item, kind in items.items():
+        if item.startswith("/"):
+            # Absolute paths can never resolve relative to -m.
+            statuses.append(("missing", kind, item))
+            continue
+        location = os.path.join(media_folder, item)
+        exists = os.path.isdir(location) or os.path.isfile(location)
+        statuses.append(("found" if exists else "missing", kind, item))
+
+    missing = [entry for entry in statuses if entry[0] == "missing"]
+    if not missing:
+        logging.debug(
+            f"Media folder structure OK: the layout scan found all "
+            f"{len(statuses)} expected media items")
+        return
+
+    # Missing items first, so the problem rows are easy to scan.
+    statuses.sort(key=lambda entry: (entry[0] != "missing", entry[2]))
+    table = "\n".join(
+        [f"  {'Status':<9}{'Type':<8}Expected item",
+         f"  {'-------':<9}{'------':<8}---------------------------"]
+        + [f"  {status:<9}{kind:<8}{item}"
+           for status, kind, item in statuses])
+
+    found = len(statuses) - len(missing)
+    if found == 0:
+        example = next((item for _, kind, item in statuses
+                        if kind == "folder"), statuses[0][2])
+        logging.error(
+            f"The media layout scan found 0 of {len(statuses)} expected "
+            f"media items inside '{media_folder}'. The database references "
+            f"paths like '{example}/...'. Make sure the folder given with "
+            "-m is the phone's WhatsApp folder containing them directly "
+            "(for Android, that includes the Media directory). All media "
+            f"will render as missing.\n{table}")
+    else:
+        logging.warning(
+            f"The media layout scan found {found} of {len(statuses)} "
+            f"expected media items inside '{media_folder}'. Media in the "
+            f"missing items below will render as missing.\n{table}")
+
 
 def _get_media_count(cursor, filter_empty, filter_date, filter_chat):
     """Get the total number of media files to process."""
@@ -623,6 +827,7 @@ def _get_media_count(cursor, filter_empty, filter_date, filter_chat):
             filter_chat[0], True, ["messages.key_remote_jid", "remote_resource"], "jid", "android")
         exclude_filter = get_chat_condition(
             filter_chat[1], False, ["messages.key_remote_jid", "remote_resource"], "jid", "android")
+        person_filter = get_person_chat_condition(filter_chat[2], "messages.key_remote_jid")
 
         cursor.execute(f"""SELECT count()
                     FROM message_media
@@ -632,11 +837,12 @@ def _get_media_count(cursor, filter_empty, filter_date, filter_chat):
                             ON messages.key_remote_jid = jid.raw_string
                         LEFT JOIN chat
                             ON chat.jid_row_id = jid._id
-                    WHERE 1=1  
+                    WHERE 1=1
                         {empty_filter}
                         {date_filter}
                         {include_filter}
-                        {exclude_filter}""")
+                        {exclude_filter}
+                        {person_filter}""")
     except sqlite3.OperationalError as e:
         logging.debug(f'Got sql error "{e}" in _get_media_count trying fallback.\n')
         empty_filter = get_cond_for_empty(filter_empty, "jid.raw_string", "broadcast")
@@ -645,6 +851,7 @@ def _get_media_count(cursor, filter_empty, filter_date, filter_chat):
             filter_chat[0], True, ["key_remote_jid", "group_sender_jid"], "jid", "android")
         exclude_filter = get_chat_condition(
             filter_chat[1], False, ["key_remote_jid", "group_sender_jid"], "jid", "android")
+        person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
         cursor.execute(f"""SELECT count(),
                         COALESCE(lid_global.raw_string, jid.raw_string) as key_remote_jid,
@@ -666,11 +873,12 @@ def _get_media_count(cursor, filter_empty, filter_date, filter_chat):
                             ON message.sender_jid_row_id = jid_map_group.lid_row_id
                         LEFT JOIN jid lid_group
                             ON jid_map_group.jid_row_id = lid_group._id
-                    WHERE 1=1    
+                    WHERE 1=1
                         {empty_filter}
                         {date_filter}
                         {include_filter}
-                        {exclude_filter}""")
+                        {exclude_filter}
+                        {person_filter}""")
     return cursor.fetchone()[0]
 
 
@@ -682,6 +890,7 @@ def _get_media_cursor_legacy(cursor, filter_empty, filter_date, filter_chat):
         filter_chat[0], True, ["messages.key_remote_jid", "remote_resource"], "jid", "android")
     exclude_filter = get_chat_condition(
         filter_chat[1], False, ["messages.key_remote_jid", "remote_resource"], "jid", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "messages.key_remote_jid")
 
     cursor.execute(f"""SELECT messages.key_remote_jid,
                         message_row_id,
@@ -705,6 +914,7 @@ def _get_media_cursor_legacy(cursor, filter_empty, filter_date, filter_chat):
                     {date_filter}
                     {include_filter}
                     {exclude_filter}
+                    {person_filter}
                 ORDER BY messages.key_remote_jid ASC""")
     return cursor
 
@@ -717,6 +927,7 @@ def _get_media_cursor_new(cursor, filter_empty, filter_date, filter_chat):
         filter_chat[0], True, ["key_remote_jid", "group_sender_jid"], "jid", "android")
     exclude_filter = get_chat_condition(
         filter_chat[1], False, ["key_remote_jid", "group_sender_jid"], "jid", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
     cursor.execute(f"""SELECT COALESCE(lid_global.raw_string, jid.raw_string) as key_remote_jid,
                     message_row_id,
@@ -751,12 +962,14 @@ def _get_media_cursor_new(cursor, filter_empty, filter_date, filter_chat):
                     {date_filter}
                     {include_filter}
                     {exclude_filter}
+                    {person_filter}
                 ORDER BY jid.raw_string ASC""")
     return cursor
 
 
-def _process_single_media(data, content, media_folder, mime, separate_media, fix_dot_files=False):
+def _process_single_media(data, content, media_folder, mime, separate_media, fix_dot_files=False, output_media_folder=None):
     """Process a single media file."""
+    write_folder = output_media_folder or media_folder
     file_path = f"{media_folder}/{content['file_path']}"
     current_chat = data.get_chat(content["key_remote_jid"])
     message = current_chat.get_message(content["message_row_id"])
@@ -788,11 +1001,13 @@ def _process_single_media(data, content, media_folder, mime, separate_media, fix
             chat_display_name = safe_name(current_chat.name or message.sender
                                           or content["key_remote_jid"].split('@')[0])
             current_filename = file_path.split("/")[-1]
-            new_folder = os.path.join(media_folder, "separated", chat_display_name)
+            # The copy is written into the output folder, while message.data
+            # keeps the path relative to the media folder so it resolves
+            # inside the output directory.
+            new_folder = os.path.join(write_folder, "separated", chat_display_name)
             Path(new_folder).mkdir(parents=True, exist_ok=True)
-            new_path = os.path.join(new_folder, current_filename)
-            shutil.copy2(file_path, new_path)
-            message.data = new_path
+            shutil.copy2(file_path, os.path.join(new_folder, current_filename))
+            message.data = os.path.join(media_folder, "separated", chat_display_name, current_filename)
         else:
             message.data = file_path
     else:
@@ -802,34 +1017,45 @@ def _process_single_media(data, content, media_folder, mime, separate_media, fix
 
     # Handle thumbnail
     if content["thumbnail"] is not None:
-        thumb_path = f"{media_folder}/thumbnails/{b64decode(content['file_hash']).hex()}.png"
+        thumb_name = f"{b64decode(content['file_hash']).hex()}.png"
+        thumb_path = f"{write_folder}/thumbnails/{thumb_name}"
         if not os.path.isfile(thumb_path):
             with open(thumb_path, "wb") as f:
                 f.write(content["thumbnail"])
-        message.thumb = thumb_path
+        message.thumb = f"{media_folder}/thumbnails/{thumb_name}"
 
 
-def vcard(db, data, media_folder, filter_date, filter_chat, filter_empty):
+def vcard(db, data, media_folder, filter_date, filter_chat, filter_empty, output_media_folder=None):
     """Process vCard data from WhatsApp database and save to files."""
     c = db.cursor()
     try:
         rows = _execute_vcard_query_modern(c, filter_date, filter_chat, filter_empty)
     except sqlite3.OperationalError as e:
         logging.debug(f'Got sql error "{e}" in _execute_vcard_query_modern trying fallback.\n')
-        rows = _execute_vcard_query_legacy(c, filter_date, filter_chat, filter_empty)
+        rows = _execute_vcard_query_legacy(
+            c, filter_date, filter_chat, filter_empty, check_jid_map(db))
 
     total_row_number = len(rows)
 
-    # Create vCards directory if it doesn't exist
-    path = os.path.join(media_folder, "vCards")
+    # Create vCards directory if it doesn't exist, in the folder the copies
+    # are written to; message references stay relative to the media folder.
+    write_folder = output_media_folder or media_folder
+    path = os.path.join(write_folder, "vCards")
+    reference_path = os.path.join(media_folder, "vCards")
     Path(path).mkdir(parents=True, exist_ok=True)
 
     with tqdm(total=total_row_number, desc="Processing vCards", unit="vcard", leave=False) as pbar:
+        skipped = 0
         for row in rows:
-            _process_vcard_row(row, path, data)
+            if not _process_vcard_row(row, path, reference_path, data):
+                skipped += 1
             pbar.update(1)
         total_time = pbar.format_dict['elapsed']
     logging.info(f"Processed {total_row_number} vCards in {convert_time_unit(total_time)}")
+    if skipped:
+        logging.warning(
+            f"Skipped {skipped} of {total_row_number} vCards whose chat or message "
+            "is not in the collection (deleted chats, or LIDs without a jid_map entry).")
 
 def _execute_vcard_query_modern(c, filter_date, filter_chat, filter_empty):
     """Execute vCard query for modern WhatsApp database schema."""
@@ -841,6 +1067,7 @@ def _execute_vcard_query_modern(c, filter_date, filter_chat, filter_empty):
         filter_chat[0], True, ["key_remote_jid", "group_sender_jid"], "jid", "android")
     exclude_filter = get_chat_condition(
         filter_chat[1], False, ["key_remote_jid", "group_sender_jid"], "jid", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
     query = f"""SELECT message_row_id,
                     COALESCE(lid_global.raw_string, jid.raw_string) as key_remote_jid,
@@ -869,12 +1096,13 @@ def _execute_vcard_query_modern(c, filter_date, filter_chat, filter_empty):
                 {date_filter}
                 {include_filter}
                 {exclude_filter}
+                {person_filter}
              ORDER BY messages.key_remote_jid ASC;"""
     c.execute(query)
     return c.fetchall()
 
 
-def _execute_vcard_query_legacy(c, filter_date, filter_chat, filter_empty):
+def _execute_vcard_query_legacy(c, filter_date, filter_chat, filter_empty, jid_map_exists=False):
     """Execute vCard query for legacy WhatsApp database schema."""
 
     # Build the filter conditions
@@ -882,11 +1110,25 @@ def _execute_vcard_query_legacy(c, filter_date, filter_chat, filter_empty):
         filter_chat[0], True, ["key_remote_jid", "jid_group.raw_string"], "jid", "android")
     chat_filter_exclude = get_chat_condition(
         filter_chat[1], False, ["key_remote_jid", "jid_group.raw_string"], "jid", "android")
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
     date_filter = f'AND message.timestamp {filter_date}' if filter_date is not None else ''
     empty_filter = get_cond_for_empty(filter_empty, "key_remote_jid", "broadcast")
 
+    # On hybrid schemas (legacy table names but jid_map-era LIDs), resolve
+    # the chat's LID to the phone JID the same way the new message query
+    # does, so vCard rows land on the chat key the collection uses.
+    if jid_map_exists:
+        key_remote_jid_selection = "COALESCE(lid_global.raw_string, jid.raw_string)"
+        lid_joins = """LEFT JOIN jid_map AS jid_map_global
+                        ON chat.jid_row_id = jid_map_global.lid_row_id
+                    LEFT JOIN jid AS lid_global
+                        ON jid_map_global.jid_row_id = lid_global._id"""
+    else:
+        key_remote_jid_selection = "jid.raw_string"
+        lid_joins = ""
+
     query = f"""SELECT message_row_id,
-                jid.raw_string as key_remote_jid,
+                {key_remote_jid_selection} as key_remote_jid,
                 vcard,
                 message.text_data as media_name
              FROM message_vcard
@@ -898,18 +1140,38 @@ def _execute_vcard_query_legacy(c, filter_date, filter_chat, filter_empty):
                     ON jid._id = chat.jid_row_id
                 LEFT JOIN jid jid_group
                     ON jid_group._id = message.sender_jid_row_id
+                {lid_joins}
             WHERE 1=1
                 {empty_filter}
                 {date_filter}
                 {chat_filter_include}
                 {chat_filter_exclude}
+                {person_filter}
              ORDER BY message.chat_row_id ASC;"""
     c.execute(query)
     return c.fetchall()
 
 
-def _process_vcard_row(row, path, data):
-    """Process a single vCard row and save to file."""
+def _process_vcard_row(row, path, reference_path, data):
+    """Process a single vCard row and save to file.
+
+    Returns True if the vCard was attached to its message, False if the
+    row was skipped because its chat or message is not in the collection
+    (e.g. deleted chat, or a LID that no jid_map entry resolves).
+    """
+    chat = data.get_chat(row["key_remote_jid"])
+    if chat is None:
+        logging.debug(
+            f'Chat {row["key_remote_jid"]} of vCard message '
+            f'{row["message_row_id"]} is not in the collection, skipping.')
+        return False
+    message = chat.get_message(row["message_row_id"])
+    if message is None:
+        logging.debug(
+            f'Message {row["message_row_id"]} of chat {row["key_remote_jid"]} '
+            'is not in the collection, skipping.')
+        return False
+
     media_name = row["media_name"] if row["media_name"] is not None else "Undefined vCard File"
     file_name = "".join(x for x in media_name if x.isalnum())
     file_name = file_name.encode('utf-8')[:230].decode('utf-8', 'ignore')
@@ -919,12 +1181,14 @@ def _process_vcard_row(row, path, data):
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(row["vcard"])
 
+    reference = os.path.join(reference_path, f"{file_name}.vcf")
     message = data.get_chat(row["key_remote_jid"]).get_message(row["message_row_id"])
     message.data = "This media include the following vCard file(s):<br>" \
-        f'<a href="{htmle(file_path)}">{htmle(media_name)}</a>'
+        f'<a href="{htmle(reference)}">{htmle(media_name)}</a>'
     message.mime = "text/x-vcard"
     message.meta = True
     message.safe = True
+    return True
 
 
 def calls(db, data, timezone_offset, filter_chat):
@@ -961,6 +1225,7 @@ def _get_calls_count(c, filter_chat):
     # Build the filter conditions
     include_filter = get_chat_condition(filter_chat[0], True, ["key_remote_jid"])
     exclude_filter = get_chat_condition(filter_chat[1], False, ["key_remote_jid"])
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
     query = f"""SELECT count(),
                 COALESCE(lid_global.raw_string, jid.raw_string) as key_remote_jid
@@ -975,7 +1240,8 @@ def _get_calls_count(c, filter_chat):
                     ON jid_map_global.jid_row_id = lid_global._id
             WHERE 1=1
                 {include_filter}
-                {exclude_filter}"""
+                {exclude_filter}
+                {person_filter}"""
     c.execute(query)
     return c.fetchone()[0]
 
@@ -986,6 +1252,7 @@ def _fetch_calls_data(c, filter_chat):
     # Build the filter conditions
     include_filter = get_chat_condition(filter_chat[0], True, ["key_remote_jid"])
     exclude_filter = get_chat_condition(filter_chat[1], False, ["key_remote_jid"])
+    person_filter = get_person_chat_condition(filter_chat[2], "key_remote_jid")
 
     query = f"""SELECT call_log._id,
                     COALESCE(lid_global.raw_string, jid.raw_string) as key_remote_jid,
@@ -1008,7 +1275,8 @@ def _fetch_calls_data(c, filter_chat):
                     ON jid_map_global.jid_row_id = lid_global._id
             WHERE 1=1
                 {include_filter}
-                {exclude_filter}"""
+                {exclude_filter}
+                {person_filter}"""
     c.execute(query)
     return c
 
